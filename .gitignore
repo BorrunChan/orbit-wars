@@ -19,6 +19,10 @@ submission.tar.gz
 # Bulk data (regenerable, MB-scale)
 data/
 
+# Opponent-bot weight artifacts (e.g. mlhybrid drops weights.npz on disk)
+weights.npz
+*.npz
+
 # Third-party opponents (downloaded from public Kaggle notebooks — not ours
 # to redistribute. They live locally for benchmarking only.)
 opponents/
