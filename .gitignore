@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Generated / scratch
+main_search.py
+sim_v16.py
+search_history.json
+*.html
+submission.tar.gz
+
+# Third-party opponents (downloaded from public Kaggle notebooks — not ours
+# to redistribute. They live locally for benchmarking only.)
+opponents/
+*.ipynb
