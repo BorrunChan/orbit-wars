@@ -241,9 +241,16 @@ def _simulate(state, my_actions, opp_actions, horizon, player, num_players=2,
                 if opp_moves:
                     actions[opp] = opp_moves
         sim.step(state, actions)
+    base = sim.evaluate(state, player)
     if _VALUE_TREES is not None:
-        return _value_eval(state, player, num_players)
-    return sim.evaluate(state, player)
+        v_logit = _value_eval(state, player, num_players)
+        # Blend: sim_eval is the trusted signal (v20 = 45% on this with only
+        # sim_eval). V adds a small nudge. V's logit is roughly [-5, +5];
+        # scale to ~base magnitude (base is ship-units, often 100-2000) via
+        # multiplying by 30. Coefficient 0.2 means V contributes ≤ ±30 to
+        # base — meaningful but bounded.
+        return base + 0.2 * v_logit * 30
+    return base
 
 
 def _value_eval(state, player, num_players):

@@ -15,20 +15,9 @@ import math
 from copy import deepcopy
 
 # kaggle_environments.agent.get_last_callable appends the loaded file's
-# directory to sys.path before exec'ing it, so sibling modules are
+# directory to sys.path before exec'ing it, so a sibling `sim.py` is
 # importable directly.
 import sim  # noqa: E402
-
-# Load learned value function (V(state) -> logit P(I win)). Falls back to
-# sim.evaluate when the model file is missing (e.g. before training is run).
-_VALUE_TREES = None
-_VALUE_INIT = 0.0
-try:
-    import value_model
-    _VALUE_TREES = getattr(value_model, "GBC_TREES", None)
-    _VALUE_INIT = getattr(value_model, "GBC_INIT", 0.0)
-except Exception:
-    pass
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import (
     Planet, Fleet, CENTER, ROTATION_RADIUS_LIMIT, BOARD_SIZE, SUN_RADIUS,
@@ -241,78 +230,7 @@ def _simulate(state, my_actions, opp_actions, horizon, player, num_players=2,
                 if opp_moves:
                     actions[opp] = opp_moves
         sim.step(state, actions)
-    if _VALUE_TREES is not None:
-        return _value_eval(state, player, num_players)
     return sim.evaluate(state, player)
-
-
-def _value_eval(state, player, num_players):
-    """Eval using learned V(state) GBC trees. Returns logit (higher = better)."""
-    # Build state summary that matches features used in training.
-    my_ships = opp_ships = 0
-    my_planets = opp_planets = neutral_planets = 0
-    my_prod = opp_prod = 0
-    my_fleet_ships = opp_fleet_ships = 0
-    my_centrality = 0.0
-    my_planet_xy = []
-    for p in state["planets"]:
-        if p[1] == player:
-            my_ships += p[5]
-            my_planets += 1
-            my_prod += p[6]
-            my_planet_xy.append((p[2], p[3]))
-        elif p[1] != -1:
-            opp_ships += p[5]
-            opp_planets += 1
-            opp_prod += p[6]
-        else:
-            neutral_planets += 1
-    for f in state["fleets"]:
-        if f[1] == player:
-            my_fleet_ships += f[6]
-            my_ships += f[6]
-        elif f[1] != -1:
-            opp_fleet_ships += f[6]
-            opp_ships += f[6]
-    if my_planets > 0:
-        cx = sum(x for x, y in my_planet_xy) / my_planets
-        cy = sum(y for x, y in my_planet_xy) / my_planets
-        my_centrality = math.hypot(cx - 50, cy - 50)
-    step = state["step"]
-    total_planets = max(1, my_planets + opp_planets + neutral_planets)
-    total_ships = max(1, my_ships + opp_ships)
-    total_prod = max(1, my_prod + opp_prod)
-    total_fleet_ships = max(1, my_fleet_ships + opp_fleet_ships)
-    def sd(a, b):
-        return a / b if b > 1e-9 else 0.0
-    feats = [
-        step / 500.0,
-        num_players / 4.0,
-        sd(my_planets, total_planets),
-        sd(opp_planets, total_planets),
-        sd(neutral_planets, total_planets),
-        sd(my_ships, total_ships),
-        sd(my_prod, total_prod),
-        sd(my_fleet_ships, total_fleet_ships),
-        sd(my_ships - opp_ships, total_ships),
-        sd(my_planets - opp_planets, total_planets),
-        sd(my_prod - opp_prod, total_prod),
-        my_centrality / 60.0,
-        1.0 if num_players == 2 else 0.0,
-        1.0 if num_players == 4 else 0.0,
-        sd(my_ships + my_fleet_ships, total_ships + total_fleet_ships),
-        sd(my_ships, max(1, my_planets)) / 50.0,
-    ]
-    z = _VALUE_INIT
-    for feat, thr, val, left, right in _VALUE_TREES:
-        node = 0
-        while feat[node] >= 0:
-            if feats[feat[node]] <= thr[node]:
-                node = left[node]
-            else:
-                node = right[node]
-        z += val[node]
-    return z
 
 
 def agent(obs):
