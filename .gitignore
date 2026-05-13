@@ -12,8 +12,12 @@ venv/
 main_search.py
 sim_v16.py
 search_history.json
+search_b_history.json
 *.html
 submission.tar.gz
+
+# Bulk data (regenerable, MB-scale)
+data/
 
 # Third-party opponents (downloaded from public Kaggle notebooks — not ours
 # to redistribute. They live locally for benchmarking only.)

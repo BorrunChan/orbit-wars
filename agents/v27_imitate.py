@@ -1,0 +1,410 @@
+"""
+Orbit Wars - Agent v3
+
+v2d (conservation, dispatch math) + forward-simulation move filtering.
+
+For each candidate move from v2d's heuristic, simulate 10 turns ahead with a
+starter-like opponent model. Accept the move only if it improves the eval
+(my_ships - opp_ships, plus production lookahead) over not taking it.
+
+This filters out attacks whose targets get retaken or whose ships would have
+been better off held in reserve.
+"""
+
+import math
+from copy import deepcopy
+
+# kaggle_environments.agent.get_last_callable appends the loaded file's
+# directory to sys.path before exec'ing it, so a sibling `sim.py` is
+# importable directly.
+import sim  # noqa: E402
+
+from kaggle_environments.envs.orbit_wars.orbit_wars import (
+    Planet, Fleet, CENTER, ROTATION_RADIUS_LIMIT, BOARD_SIZE, SUN_RADIUS,
+)
+
+MAX_SPEED = 6.0
+SUN_BUFFER = 0.6
+EPISODE_STEPS = 500
+SIM_HORIZON = 16     # turns to look ahead
+DEFENSE_HORIZON = 40
+
+
+def _speed(ships):
+    s = max(1, ships)
+    return min(MAX_SPEED, 1.0 + (MAX_SPEED - 1.0) * (math.log(s) / math.log(1000)) ** 1.5)
+
+
+def _predict_position(pid, current_pos, initial_by_id, angular_velocity,
+                       step_now, future_step, comet_groups):
+    for group in comet_groups:
+        if pid in group["planet_ids"]:
+            i = group["planet_ids"].index(pid)
+            new_idx = group["path_index"] + (future_step - step_now)
+            path = group["paths"][i]
+            if 0 <= new_idx < len(path):
+                return (path[new_idx][0], path[new_idx][1])
+            return None
+    init = initial_by_id.get(pid)
+    if init is None:
+        return current_pos
+    dx, dy = init[2] - CENTER, init[3] - CENTER
+    r = math.hypot(dx, dy)
+    if r + init[4] >= ROTATION_RADIUS_LIMIT:
+        return (init[2], init[3])
+    a0 = math.atan2(dy, dx)
+    a1 = a0 + angular_velocity * future_step
+    return (CENTER + r * math.cos(a1), CENTER + r * math.sin(a1))
+
+
+def _safe_launch_angle(src, dst, target_radius):
+    sx, sy = src; tx, ty = dst
+    tdx, tdy = tx - sx, ty - sy
+    tdist = math.hypot(tdx, tdy)
+    if tdist < 1e-6:
+        return 0.0
+    tgt_angle = math.atan2(tdy, tdx)
+    sdx, sdy = CENTER - sx, CENTER - sy
+    sdist = math.hypot(sdx, sdy)
+    R = SUN_RADIUS + SUN_BUFFER
+    if sdist <= R:
+        return tgt_angle
+    sun_angle = math.atan2(sdy, sdx)
+    sun_half = math.asin(min(1.0, R / sdist))
+    if tdist <= target_radius:
+        return tgt_angle
+    tgt_half = math.asin(min(1.0, target_radius / tdist))
+    diff = (tgt_angle - sun_angle + math.pi) % (2 * math.pi) - math.pi
+    if abs(diff) >= sun_half + tgt_half:
+        return tgt_angle
+    chosen = sun_angle + (sun_half + 1e-3 if diff >= 0 else -sun_half - 1e-3)
+    delta = (chosen - tgt_angle + math.pi) % (2 * math.pi) - math.pi
+    if abs(delta) > tgt_half - 1e-3:
+        return None
+    return chosen
+
+
+def _capture_cost(mine_x, mine_y, target, predicted_dst, available, step_now,
+                   initial_by_id, angular_velocity, comet_groups, player):
+    tgt_owner = target.owner
+    tgt_prod = target.production
+    tgt_ships = target.ships
+    s = max(1, tgt_ships + 1)
+    last_T = None
+    arrival_pos = predicted_dst
+    for _ in range(6):
+        dx = arrival_pos[0] - mine_x
+        dy = arrival_pos[1] - mine_y
+        dist = math.hypot(dx, dy)
+        speed = _speed(s)
+        T = max(1, math.ceil(dist / speed))
+        pos = _predict_position(target.id, (target.x, target.y),
+                                 initial_by_id, angular_velocity, step_now,
+                                 step_now + T, comet_groups)
+        if pos is None:
+            return None
+        arrival_pos = pos
+        if tgt_owner == -1:
+            needed = tgt_ships + 1
+        else:
+            needed = tgt_ships + tgt_prod * T + 1
+        if needed > available:
+            return None
+        if s >= needed and last_T == T:
+            return s, T, arrival_pos
+        s = max(s, needed)
+        last_T = T
+    if s <= available:
+        return s, last_T or 1, arrival_pos
+    return None
+
+
+def _fleet_eta(fleet, my_planet, initial_by_id, angular_velocity, step_now,
+                comet_groups):
+    spd = _speed(fleet.ships)
+    cx, cy = math.cos(fleet.angle) * spd, math.sin(fleet.angle) * spd
+    for t in range(1, DEFENSE_HORIZON + 1):
+        nx = fleet.x + cx * t
+        ny = fleet.y + cy * t
+        if not (0 <= nx <= BOARD_SIZE and 0 <= ny <= BOARD_SIZE):
+            return None
+        pos = _predict_position(my_planet.id, (my_planet.x, my_planet.y),
+                                 initial_by_id, angular_velocity, step_now,
+                                 step_now + t, comet_groups)
+        if pos is None:
+            return None
+        if math.hypot(nx - pos[0], ny - pos[1]) <= my_planet.radius:
+            return t
+    return None
+
+
+def _doom_deficit(mp, threats):
+    """If planet falls even with zero dispatch, return (failing_turn, deficit).
+    Else None."""
+    if not threats:
+        return None
+    grouped = {}
+    for t, sh in threats:
+        grouped[t] = grouped.get(t, 0) + sh
+    ts = sorted(grouped)
+    garrison = mp.ships
+    prev_t = 0
+    for t in ts:
+        garrison += mp.production * (t - prev_t)
+        e = grouped[t]
+        if e > garrison:
+            return t, e - garrison + 1
+        garrison -= e
+        prev_t = t
+    return None
+
+
+def _max_dispatch(mp, threats):
+    if not threats:
+        return mp.ships
+    grouped = {}
+    for t, sh in threats:
+        grouped[t] = grouped.get(t, 0) + sh
+    ts = sorted(grouped)
+    cum = 0
+    min_cap = float('inf')
+    for t in ts:
+        cap = mp.ships + mp.production * t - cum - grouped[t]
+        min_cap = min(min_cap, cap)
+        cum += grouped[t]
+    if min_cap < 0:
+        return mp.ships  # planet doomed, send everything elsewhere
+    return max(0, int(min_cap))
+
+
+# -- Opponent model used inside sim rollouts: starter-like --
+
+def _opp_starter_moves(state, opp_player):
+    """Approximate starter's decision: each mine with >=20 ships sends half
+    toward the closest static unowned target."""
+    moves = []
+    for p in state["planets"]:
+        if p[1] != opp_player or p[5] < 16:
+            continue
+        x0, y0 = p[2], p[3]
+        best = None; best_d = float('inf')
+        for q in state["planets"]:
+            if q[1] == opp_player:
+                continue
+            orbital_r = math.hypot(q[2] - CENTER, q[3] - CENTER)
+            if orbital_r + q[4] < ROTATION_RADIUS_LIMIT:
+                continue
+            d = math.hypot(q[2] - x0, q[3] - y0)
+            if d < best_d:
+                best_d = d; best = q
+        if best is None:
+            continue
+        ships = p[5] // 2
+        if ships < 20:
+            continue
+        angle = math.atan2(best[3] - y0, best[2] - x0)
+        moves.append([p[0], angle, ships])
+    return moves
+
+
+def _simulate(state, my_actions, opp_actions, horizon, player, num_players=2,
+                opp_model="starter"):
+    """Apply this turn's actions, then run `horizon` turns. opp_model decides
+    what we expect the opponent to do each future turn:
+      - "starter": each non-self player sends half-ship fleets at closest static
+      - "none":    no new opp launches (only existing fleets resolve)
+    """
+    actions = [None] * num_players
+    actions[player] = my_actions
+    if opp_actions and num_players == 2:
+        actions[1 - player] = opp_actions
+    sim.step(state, actions)
+    for _ in range(horizon - 1):
+        actions = [None] * num_players
+        actions[player] = []
+        if opp_model == "starter":
+            for opp in range(num_players):
+                if opp == player:
+                    continue
+                opp_moves = _opp_starter_moves(state, opp)
+                if opp_moves:
+                    actions[opp] = opp_moves
+        sim.step(state, actions)
+    return sim.evaluate(state, player)
+
+
+def agent(obs):
+    if isinstance(obs, dict):
+        getf = obs.get
+    else:
+        getf = lambda k, default=None: getattr(obs, k, default)
+
+    player = getf("player", 0)
+    raw_planets = getf("planets", []) or []
+    raw_fleets = getf("fleets", []) or []
+    initial_planets = getf("initial_planets", []) or []
+    angular_velocity = getf("angular_velocity", 0.0) or 0.0
+    step_now = getf("step", 0) or 0
+    comet_groups = getf("comets", []) or []
+
+    initial_owners = {p[1] for p in initial_planets if p[1] != -1}
+    num_players = max(2, max(initial_owners) + 1 if initial_owners else 2)
+
+    planets = [Planet(*p) for p in raw_planets]
+    fleets = [Fleet(*f) for f in raw_fleets]
+    my_planets = [p for p in planets if p.owner == player]
+    if not my_planets:
+        return []
+    targets = [p for p in planets if p.owner != player]
+    if not targets:
+        return []
+    initial_by_id = {p[0]: p for p in initial_planets}
+    game_remaining = max(1, EPISODE_STEPS - step_now)
+
+    # Threats
+    threats_per_planet = {p.id: [] for p in my_planets}
+    for fleet in fleets:
+        if fleet.owner == player:
+            continue
+        best = None
+        for mp in my_planets:
+            t = _fleet_eta(fleet, mp, initial_by_id, angular_velocity,
+                            step_now, comet_groups)
+            if t is not None and (best is None or t < best[0]):
+                best = (t, mp.id)
+        if best is not None:
+            threats_per_planet[best[1]].append((best[0], fleet.ships))
+
+    max_launch = {}
+    for mine in my_planets:
+        thr = threats_per_planet[mine.id]
+        max_launch[mine.id] = _max_dispatch(mine, sorted(thr))
+
+    # Build candidate attack list. Inspired by winner-trace analysis: winners
+    # send ~80% of source ships (not min capture), prefer high-prod targets,
+    # and launch from turn 1.
+    #
+    # Variants generated per (mine, target):
+    #   A. min_capture (cheap)
+    #   B. half_source  (≈starter / lb1224 style)
+    #   C. big_chunk    (~80% of source — high-prod targets)
+    candidates = []
+    for mine in my_planets:
+        avail = max_launch[mine.id]
+        if avail <= 1:
+            continue
+        for tgt in targets:
+            est = _capture_cost(mine.x, mine.y, tgt, (tgt.x, tgt.y), avail,
+                                 step_now, initial_by_id, angular_velocity,
+                                 comet_groups, player)
+            if est is None:
+                continue
+            min_ships, T, arrival = est
+            angle = _safe_launch_angle((mine.x, mine.y), arrival, tgt.radius)
+            if angle is None:
+                continue
+            time_owned = max(0, game_remaining - T)
+            # Winners prefer prod >= 3 — boost value for those.
+            prod_boost = 1.0 + 0.4 * max(0, tgt.production - 2)
+            base_value = tgt.production * time_owned * prod_boost
+            if tgt.owner != -1:
+                base_value += tgt.production * time_owned * prod_boost
+
+            # Variant A: minimum capture
+            candidates.append((base_value / (min_ships + 1.0 * T),
+                                mine.id, tgt.id, min_ships, angle, T, "min"))
+
+            # Variant B: half-source (starter-like)
+            half_ships = min(avail, max(min_ships, mine.ships // 2))
+            if half_ships > min_ships and half_ships <= avail:
+                dist = math.hypot(arrival[0] - mine.x, arrival[1] - mine.y)
+                T_half = max(1, math.ceil(dist / _speed(half_ships)))
+                candidates.append((base_value / (half_ships + 1.0 * T_half) * 0.95,
+                                    mine.id, tgt.id, half_ships, angle, T_half, "half"))
+
+            # Variant C: 80% of source (lb1224-style for high-prod targets)
+            big_ships = min(avail, max(min_ships, int(mine.ships * 0.8)))
+            if big_ships > half_ships and big_ships <= avail and tgt.production >= 3:
+                dist = math.hypot(arrival[0] - mine.x, arrival[1] - mine.y)
+                T_big = max(1, math.ceil(dist / _speed(big_ships)))
+                candidates.append((base_value / (big_ships + 1.0 * T_big) * 0.90,
+                                    mine.id, tgt.id, big_ships, angle, T_big, "big"))
+
+    candidates.sort(reverse=True, key=lambda c: c[0])
+
+    # Greedy sim-validated allocation
+    sim_state_base = sim.make_state_from_obs(obs)
+    baseline_state = sim.clone(sim_state_base)
+    baseline_eval = _simulate(baseline_state, [], [], SIM_HORIZON, player,
+                                num_players=num_players, opp_model="starter")
+
+    accepted = []
+    used = {p.id: 0 for p in my_planets}
+    targeted = set()
+    current_best = baseline_eval
+
+    # Group candidates by (mid, tid). For each (mid, tid), present both
+    # variants (min and buffered) and let sim pick whichever — or neither.
+    K = min(25, len(candidates))  # bumped from 15: now 3 variants per pair
+    grouped = {}
+    for c in candidates[:K]:
+        key = (c[1], c[2])  # (mid, tid)
+        grouped.setdefault(key, []).append(c)
+
+    # Visit groups in score order of their best variant
+    group_keys = sorted(grouped.keys(),
+                         key=lambda k: max(c[0] for c in grouped[k]),
+                         reverse=True)
+    for key in group_keys:
+        mid, tid = key
+        if tid in targeted:
+            continue
+        best_variant = None
+        best_eval_for_group = current_best
+        for score, _mid, _tid, ships, angle, T, _tag in grouped[key]:
+            if max_launch[mid] - used[mid] < ships:
+                continue
+            trial_moves = accepted + [[mid, angle, int(ships)]]
+            trial_state = sim.clone(sim_state_base)
+            new_eval = _simulate(trial_state, trial_moves, [], SIM_HORIZON,
+                                  player, num_players=num_players,
+                                  opp_model="starter")
+            if new_eval > best_eval_for_group:
+                best_eval_for_group = new_eval
+                best_variant = (ships, angle, T)
+        if best_variant is not None:
+            ships, angle, T = best_variant
+            accepted = accepted + [[mid, angle, int(ships)]]
+            current_best = best_eval_for_group
+            used[mid] += ships
+            targeted.add(tid)
+
+    # Second pass: try dropping each accepted move; keep drops that improve.
+    i = 0
+    while i < len(accepted):
+        trial_moves = accepted[:i] + accepted[i+1:]
+        trial_state = sim.clone(sim_state_base)
+        new_eval = _simulate(trial_state, trial_moves, [], SIM_HORIZON, player,
+                              num_players=num_players, opp_model="starter")
+        if new_eval > current_best:
+            accepted = trial_moves
+            current_best = new_eval
+        else:
+            i += 1
+
+    # === Early-launch override ===
+    # Winner traces show lb1224 / structured launch at turn 1, not turn 12 like
+    # v20 (sim's "do nothing baseline" is too generous early). Force at least
+    # the top heuristic move during the first few turns.
+    if step_now < 6 and len(accepted) == 0 and candidates:
+        # Take the highest-scored candidate that fits the budget.
+        used_force = {p.id: 0 for p in my_planets}
+        for cand in candidates[:6]:
+            score, mid, tid, ships, angle, T, _tag = cand
+            if max_launch[mid] - used_force[mid] < ships:
+                continue
+            accepted.append([mid, angle, int(ships)])
+            used_force[mid] += ships
+            break  # one is enough for early game
+
+    return accepted
