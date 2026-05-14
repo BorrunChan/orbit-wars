@@ -294,6 +294,9 @@ def agent(obs):
         thr = threats_per_planet[mine.id]
         max_launch[mine.id] = _max_dispatch(mine, sorted(thr))
 
+    # Pre-compute enemy planet positions for distance penalty
+    enemy_planets = [p for p in planets if p.owner != player and p.owner != -1]
+
     # Build candidate attack list. For each (mine, target), also offer a
     # "buffered" variant that sends extra ships so the captured planet
     # survives a counter-strike. Sim decides which (if any) to take.
@@ -316,6 +319,16 @@ def agent(obs):
             base_value = tgt.production * time_owned
             if tgt.owner != -1:
                 base_value += tgt.production * time_owned
+            # Asymmetric proximity: penalize contested targets, but do NOT
+            # boost deep-territory ones (preserve v35's strength).
+            if enemy_planets:
+                d_enemy = min(math.hypot(tgt.x - e.x, tgt.y - e.y) for e in enemy_planets)
+                d_mine = math.hypot(tgt.x - mine.x, tgt.y - mine.y)
+                influence_ratio = d_enemy / max(1, d_mine)
+                if influence_ratio < 0.8:  # contested: enemy closer
+                    proximity_factor = 0.45 + influence_ratio * 0.4
+                    base_value *= proximity_factor
+                # else: no boost (ratio >= 0.8 means our space, leave value alone)
             # Variant 1: minimum capture
             candidates.append((base_value / (min_ships + 1.0 * T),
                                 mine.id, tgt.id, min_ships, angle, T))
