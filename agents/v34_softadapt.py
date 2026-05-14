@@ -30,8 +30,11 @@ try:
 except Exception:
     pass
 
-SHOT_REJECT_THRESHOLD = 0.40   # default (fast-rot tight)
-SHOT_THRESHOLD_SLOW = 0.20     # slow-rot loose (let deeper plays through)
+SHOT_REJECT_THRESHOLD = 0.40       # default (fast-rot tight filter)
+SHOT_THRESHOLD_SLOW = 0.20         # slow rot: loose filter (let v20-style play out)
+SHOT_THRESHOLD_FAST = 0.40         # fast rot: tight filter (v32-style)
+SIM_HORIZON_SLOW = 20              # slow rot: deeper sim
+SIM_HORIZON_FAST = 14              # fast rot: shorter sim
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import (
     Planet, Fleet, CENTER, ROTATION_RADIUS_LIMIT, BOARD_SIZE, SUN_RADIUS,
@@ -328,9 +331,17 @@ def agent(obs):
                 candidates.append((base_value / (big_ships + 1.0 * T) * 0.95,
                                     mine.id, tgt.id, big_ships, angle, T))
 
-    # === Map-conditional shot threshold only (keep v20 tuned sim params) ===
-    shot_threshold = (SHOT_THRESHOLD_SLOW if angular_velocity < 0.035
-                       else SHOT_REJECT_THRESHOLD)
+    # === Map-conditional dispatch ===
+    # Slow rotation favors deep sim (v20/lb1224 style); fast rotation favors
+    # tight shot filtering (v32/mlhybrid style).
+    if angular_velocity < 0.035:
+        shot_threshold = SHOT_THRESHOLD_SLOW   # 0.20 (loose)
+        sim_horizon = SIM_HORIZON_SLOW         # 20 (deeper)
+        k_cap = 20
+    else:
+        shot_threshold = SHOT_THRESHOLD_FAST   # 0.40 (tight)
+        sim_horizon = SIM_HORIZON_FAST         # 14 (shorter)
+        k_cap = 15
 
     # === Shot-reject filter (from learned classifier) ===
     if _SHOT_TREES is not None:
@@ -390,7 +401,7 @@ def agent(obs):
     # Greedy sim-validated allocation
     sim_state_base = sim.make_state_from_obs(obs)
     baseline_state = sim.clone(sim_state_base)
-    baseline_eval = _simulate(baseline_state, [], [], SIM_HORIZON, player,
+    baseline_eval = _simulate(baseline_state, [], [], sim_horizon, player,
                                 num_players=num_players, opp_model="starter")
 
     accepted = []
@@ -400,7 +411,7 @@ def agent(obs):
 
     # Group candidates by (mid, tid). For each (mid, tid), present both
     # variants (min and buffered) and let sim pick whichever — or neither.
-    K = min(15, len(candidates))
+    K = min(k_cap, len(candidates))
     grouped = {}
     for c in candidates[:K]:
         key = (c[1], c[2])  # (mid, tid)
@@ -439,7 +450,7 @@ def agent(obs):
     while i < len(accepted):
         trial_moves = accepted[:i] + accepted[i+1:]
         trial_state = sim.clone(sim_state_base)
-        new_eval = _simulate(trial_state, trial_moves, [], SIM_HORIZON, player,
+        new_eval = _simulate(trial_state, trial_moves, [], sim_horizon, player,
                               num_players=num_players, opp_model="starter")
         if new_eval > current_best:
             accepted = trial_moves
