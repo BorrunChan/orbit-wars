@@ -30,7 +30,7 @@ try:
 except Exception:
     pass
 
-SHOT_REJECT_THRESHOLD = 0.40   # default (fast-rot tight)
+SHOT_REJECT_THRESHOLD = 0.50   # default (fast-rot tight)
 SHOT_THRESHOLD_SLOW = 0.20     # slow-rot loose (let deeper plays through)
 
 from kaggle_environments.envs.orbit_wars.orbit_wars import (
@@ -294,9 +294,6 @@ def agent(obs):
         thr = threats_per_planet[mine.id]
         max_launch[mine.id] = _max_dispatch(mine, sorted(thr))
 
-    # Pre-compute enemy planet positions for distance penalty
-    enemy_planets = [p for p in planets if p.owner != player and p.owner != -1]
-
     # Build candidate attack list. For each (mine, target), also offer a
     # "buffered" variant that sends extra ships so the captured planet
     # survives a counter-strike. Sim decides which (if any) to take.
@@ -319,18 +316,6 @@ def agent(obs):
             base_value = tgt.production * time_owned
             if tgt.owner != -1:
                 base_value += tgt.production * time_owned
-            # Penalty: targets near enemy bases are vulnerable to recapture.
-            # Compute (dist_to_nearest_enemy) / (dist_from_my_source).
-            # Ratio < 1 means enemy is closer → likely retake. Downweight.
-            if enemy_planets:
-                d_enemy = min(math.hypot(tgt.x - e.x, tgt.y - e.y) for e in enemy_planets)
-                d_mine = math.hypot(tgt.x - mine.x, tgt.y - mine.y)
-                # Ratio in [0, ~3]. Near 1 = contested; > 1 = our territory.
-                influence_ratio = d_enemy / max(1, d_mine)
-                # Soft penalty: scale value by sigmoid-like function
-                # ratio 0.5 → factor 0.6; ratio 1 → 0.85; ratio 2 → 1.05
-                proximity_factor = min(1.1, 0.4 + influence_ratio * 0.35)
-                base_value *= proximity_factor
             # Variant 1: minimum capture
             candidates.append((base_value / (min_ships + 1.0 * T),
                                 mine.id, tgt.id, min_ships, angle, T))
