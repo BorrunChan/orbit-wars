@@ -408,10 +408,12 @@ def agent(obs):
     # Force at least 30% of ships available for launch in extreme cases.
     _enemy_fleets = [f for f in fleets if f.owner != player]
     _n_small = sum(1 for f in _enemy_fleets if f.ships <= 25)
-    _n_total = len(_enemy_fleets)
-    # v95: extreme = many small OR very high total fleet count (Skallis-style
-    # high-volume MEDIUM fleets, e.g. 490 launches × avg 48 — not "small")
-    extreme_swarm = (num_players == 4 and (_n_small >= 20 or _n_total >= 25))
+    extreme_swarm = (num_players == 4 and _n_small >= 20)
+    # v94: pre-compute swarm-active to skip buffered variant (save ships for more launches)
+    _opp_pc = sum(1 for p in planets if p.owner != player and p.owner != -1)
+    _expansion_def = _opp_pc > len(my_planets) + 1
+    _swarm_pre = ((num_players == 2 and (_n_small >= 3 or _expansion_def))
+                   or (num_players == 4 and _n_small >= 15))
 
     max_launch = {}
     for mine in my_planets:
@@ -449,14 +451,14 @@ def agent(obs):
             # Variant 1: minimum capture
             candidates.append((base_value / (min_ships + 1.0 * T),
                                 mine.id, tgt.id, min_ships, angle, T))
-            # Variant 2: buffered capture (~ +5 or +50% whichever is smaller)
-            buf = min(int(min_ships * 0.5) + 5, avail - min_ships)
-            if buf > 0:
-                big_ships = min_ships + buf
-                # Re-derive speed/T for new fleet size (faster)
-                # Keep angle/arrival approximation (target moves slightly less)
-                candidates.append((base_value / (big_ships + 1.0 * T) * 0.95,
-                                    mine.id, tgt.id, big_ships, angle, T))
+            # v94: skip buffered variant when swarm active — save ships for more launches
+            if not _swarm_pre:
+                # Variant 2: buffered capture (~ +5 or +50% whichever is smaller)
+                buf = min(int(min_ships * 0.5) + 5, avail - min_ships)
+                if buf > 0:
+                    big_ships = min_ships + buf
+                    candidates.append((base_value / (big_ships + 1.0 * T) * 0.95,
+                                        mine.id, tgt.id, big_ships, angle, T))
 
     # === Map + format-conditional shot threshold ===
     is_4p = num_players == 4
@@ -587,11 +589,9 @@ def agent(obs):
     # threats causing us to reject too many attacks (4P 20% → 25% by removing).
     # 2P uses "starter" — 1v1 the model is calibrated and helps.
     sim_opp_model = "none" if num_players == 4 else "starter"
-    # v98: shorter sim horizon in 2P (faster decisions, more aggressive)
-    sim_horizon = 12 if num_players == 2 else SIM_HORIZON
     sim_state_base = sim.make_state_from_obs(obs)
     baseline_state = sim.clone(sim_state_base)
-    baseline_eval = _simulate(baseline_state, [], [], sim_horizon, player,
+    baseline_eval = _simulate(baseline_state, [], [], SIM_HORIZON, player,
                                 num_players=num_players, opp_model=sim_opp_model)
 
     accepted = []
@@ -622,7 +622,7 @@ def agent(obs):
                 continue
             trial_moves = accepted + [[mid, angle, int(ships)]]
             trial_state = sim.clone(sim_state_base)
-            new_eval = _simulate(trial_state, trial_moves, [], sim_horizon,
+            new_eval = _simulate(trial_state, trial_moves, [], SIM_HORIZON,
                                   player, num_players=num_players,
                                   opp_model=sim_opp_model)
             if new_eval > best_eval_for_group:

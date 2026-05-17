@@ -46,11 +46,9 @@ except Exception:
 SHOT_REJECT_THRESHOLD = 0.40   # default (fast-rot tight)
 SHOT_THRESHOLD_SLOW = 0.20     # slow-rot loose
 
-# 4P-specific overrides. Tightened relative to 2P because 3 opponents punish
-# bad shots — but not too tight. v48: relaxed 4P (0.30→0.25 slow, 0.50→0.45
-# fast) after bench showed +8pp 4P WR (12→20%) with 2P unchanged at 44%.
-SHOT_THRESHOLD_4P_SLOW = 0.25
-SHOT_THRESHOLD_4P_FAST = 0.45
+# 4P-specific overrides (tightened — fewer shots survive 3-way contention)
+SHOT_THRESHOLD_4P_SLOW = 0.30
+SHOT_THRESHOLD_4P_FAST = 0.50
 
 
 def _v_feature_vector(planets, fleets, player, num_players, step):
@@ -403,26 +401,10 @@ def agent(obs):
         if best is not None:
             threats_per_planet[best[1]].append((best[0], fleet.ships))
 
-    # v92: extreme swarm detection — when we're being overwhelmed by lots of
-    # small enemy fleets, _max_dispatch reports 0 for most planets (paralyzed).
-    # Force at least 30% of ships available for launch in extreme cases.
-    _enemy_fleets = [f for f in fleets if f.owner != player]
-    _n_small = sum(1 for f in _enemy_fleets if f.ships <= 25)
-    _n_total = len(_enemy_fleets)
-    # v95: extreme = many small OR very high total fleet count (Skallis-style
-    # high-volume MEDIUM fleets, e.g. 490 launches × avg 48 — not "small")
-    extreme_swarm = (num_players == 4 and (_n_small >= 20 or _n_total >= 25))
-
     max_launch = {}
     for mine in my_planets:
         thr = threats_per_planet[mine.id]
-        safe = _max_dispatch(mine, sorted(thr))
-        if extreme_swarm:
-            # Allow at least 30% of current ships even if defense is risky
-            forced_min = int(mine.ships * 0.3)
-            max_launch[mine.id] = max(safe, forced_min)
-        else:
-            max_launch[mine.id] = safe
+        max_launch[mine.id] = _max_dispatch(mine, sorted(thr))
 
     # Build candidate attack list. For each (mine, target), also offer a
     # "buffered" variant that sends extra ships so the captured planet
@@ -449,13 +431,14 @@ def agent(obs):
             # Variant 1: minimum capture
             candidates.append((base_value / (min_ships + 1.0 * T),
                                 mine.id, tgt.id, min_ships, angle, T))
-            # Variant 2: buffered capture (~ +5 or +50% whichever is smaller)
-            buf = min(int(min_ships * 0.5) + 5, avail - min_ships)
+            # v46: massively buffered capture — top Kaggle players use avg 22 ships,
+            # we use 9. Bigger fleet survives counter-strike and tilts ship count
+            # advantage. Buffer is double the minimum, capped at 60% of available.
+            buf = min(min_ships, max(8, int(avail * 0.6) - min_ships))
             if buf > 0:
                 big_ships = min_ships + buf
-                # Re-derive speed/T for new fleet size (faster)
-                # Keep angle/arrival approximation (target moves slightly less)
-                candidates.append((base_value / (big_ships + 1.0 * T) * 0.95,
+                # Tie-break favoring bigger
+                candidates.append((base_value / (big_ships + 1.0 * T) * 0.99,
                                     mine.id, tgt.id, big_ships, angle, T))
 
     # === Map + format-conditional shot threshold ===
@@ -467,33 +450,6 @@ def agent(obs):
     else:
         shot_threshold = (SHOT_THRESHOLD_SLOW if angular_velocity < 0.035
                           else SHOT_REJECT_THRESHOLD)
-
-    # v84: SWARM DETECTION. In 2P, count enemy fleets in flight. If many
-    # small enemy fleets, switch to swarm-counter mode (lower threshold).
-    # Kaggle losses showed opps with 100+ launches/game (we had 100). At any
-    # snapshot mid-game, swarmers have 6-15+ active small fleets vs our 2-4.
-    # v93: two-tier swarm detection. Early light swarm catches expansion-race
-    # losses where opp gets ahead before heavy swarm visible.
-    swarm_active = False
-    enemy_fleets = [f for f in fleets if f.owner != player]
-    n_small = sum(1 for f in enemy_fleets if f.ships <= 25)
-    # Also count opp planets — if they're out-expanding us, treat as swarm risk
-    opp_planet_count = sum(1 for p in planets if p.owner != player and p.owner != -1)
-    my_planet_count = len(my_planets)
-    expansion_deficit = opp_planet_count > my_planet_count + 1  # they have ≥2 more
-
-    if num_players == 2:
-        # heavy swarm
-        if n_small >= 6:
-            swarm_active = True
-            shot_threshold = max(0.12, shot_threshold - 0.12)
-        # light swarm: smaller drop, catches early game
-        elif n_small >= 3 or expansion_deficit:
-            swarm_active = True
-            shot_threshold = max(0.15, shot_threshold - 0.06)
-    else:  # 4P
-        if n_small >= 15:
-            swarm_active = True
 
     # === V-based threshold modulation (only if model loaded) ===
     # V predicts P(I eventually win) from current state.
@@ -515,10 +471,7 @@ def agent(obs):
             p_win = 1.0 / (1.0 + math.exp(-z))
         except OverflowError:
             p_win = 1.0 if z > 0 else 0.0
-        # v69: tighten only in 2P. In 4P, sim opp="none" (v62) already biases
-        # toward attacking; V tightening cancels that gain. Bench: 4P 25→32%
-        # (+7pp), 2P unchanged at 44%. Loosening still applies in both formats.
-        if p_win > 0.7 and num_players == 2:
+        if p_win > 0.7:
             shot_threshold = min(0.65, shot_threshold + 0.10)
         elif p_win < 0.3:
             shot_threshold = max(0.10, shot_threshold - 0.15)
@@ -572,27 +525,17 @@ def agent(obs):
                 p_success = 1.0 / (1.0 + math.exp(-z))
             except OverflowError:
                 p_success = 1.0 if z > 0 else 0.0
-            # v84: when swarm is detected, also accept low-cost shots
             if p_success >= shot_threshold:
-                filtered.append(c)
-            elif swarm_active and p_success >= 0.18 and ships <= 12 and eta <= 10:
-                # v86: low-cost shots allowed in BOTH 2P and 4P when swarm
                 filtered.append(c)
         candidates = filtered
 
     candidates.sort(reverse=True, key=lambda c: c[0])
 
     # Greedy sim-validated allocation
-    # v62: in 4P, use opp_model="none" — starter model over-estimates 3-way
-    # threats causing us to reject too many attacks (4P 20% → 25% by removing).
-    # 2P uses "starter" — 1v1 the model is calibrated and helps.
-    sim_opp_model = "none" if num_players == 4 else "starter"
-    # v98: shorter sim horizon in 2P (faster decisions, more aggressive)
-    sim_horizon = 12 if num_players == 2 else SIM_HORIZON
     sim_state_base = sim.make_state_from_obs(obs)
     baseline_state = sim.clone(sim_state_base)
-    baseline_eval = _simulate(baseline_state, [], [], sim_horizon, player,
-                                num_players=num_players, opp_model=sim_opp_model)
+    baseline_eval = _simulate(baseline_state, [], [], SIM_HORIZON, player,
+                                num_players=num_players, opp_model="starter")
 
     accepted = []
     used = {p.id: 0 for p in my_planets}
@@ -622,9 +565,9 @@ def agent(obs):
                 continue
             trial_moves = accepted + [[mid, angle, int(ships)]]
             trial_state = sim.clone(sim_state_base)
-            new_eval = _simulate(trial_state, trial_moves, [], sim_horizon,
+            new_eval = _simulate(trial_state, trial_moves, [], SIM_HORIZON,
                                   player, num_players=num_players,
-                                  opp_model=sim_opp_model)
+                                  opp_model="starter")
             if new_eval > best_eval_for_group:
                 best_eval_for_group = new_eval
                 best_variant = (ships, angle, T)
@@ -635,8 +578,18 @@ def agent(obs):
             used[mid] += ships
             targeted.add(tid)
 
-    # Removed second-pass drop loop (v55). Bench showed it never fired
-    # productively (results byte-identical with vs without). Skipping saves
-    # ~25% per-turn time → more headroom for Kaggle agentTimeout.
+    # Second pass: try dropping each accepted move; keep drops that improve.
+    i = 0
+    while i < len(accepted):
+        trial_moves = accepted[:i] + accepted[i+1:]
+        trial_state = sim.clone(sim_state_base)
+        new_eval = _simulate(trial_state, trial_moves, [], SIM_HORIZON, player,
+                              num_players=num_players, opp_model="starter")
+        if new_eval > current_best:
+            accepted = trial_moves
+            current_best = new_eval
+            # Don't increment i — the next move slid down into this slot
+        else:
+            i += 1
 
     return accepted

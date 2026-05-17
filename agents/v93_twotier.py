@@ -408,10 +408,7 @@ def agent(obs):
     # Force at least 30% of ships available for launch in extreme cases.
     _enemy_fleets = [f for f in fleets if f.owner != player]
     _n_small = sum(1 for f in _enemy_fleets if f.ships <= 25)
-    _n_total = len(_enemy_fleets)
-    # v95: extreme = many small OR very high total fleet count (Skallis-style
-    # high-volume MEDIUM fleets, e.g. 490 launches × avg 48 — not "small")
-    extreme_swarm = (num_players == 4 and (_n_small >= 20 or _n_total >= 25))
+    extreme_swarm = (num_players == 4 and _n_small >= 20)
 
     max_launch = {}
     for mine in my_planets:
@@ -587,11 +584,9 @@ def agent(obs):
     # threats causing us to reject too many attacks (4P 20% → 25% by removing).
     # 2P uses "starter" — 1v1 the model is calibrated and helps.
     sim_opp_model = "none" if num_players == 4 else "starter"
-    # v98: shorter sim horizon in 2P (faster decisions, more aggressive)
-    sim_horizon = 12 if num_players == 2 else SIM_HORIZON
     sim_state_base = sim.make_state_from_obs(obs)
     baseline_state = sim.clone(sim_state_base)
-    baseline_eval = _simulate(baseline_state, [], [], sim_horizon, player,
+    baseline_eval = _simulate(baseline_state, [], [], SIM_HORIZON, player,
                                 num_players=num_players, opp_model=sim_opp_model)
 
     accepted = []
@@ -622,7 +617,7 @@ def agent(obs):
                 continue
             trial_moves = accepted + [[mid, angle, int(ships)]]
             trial_state = sim.clone(sim_state_base)
-            new_eval = _simulate(trial_state, trial_moves, [], sim_horizon,
+            new_eval = _simulate(trial_state, trial_moves, [], SIM_HORIZON,
                                   player, num_players=num_players,
                                   opp_model=sim_opp_model)
             if new_eval > best_eval_for_group:

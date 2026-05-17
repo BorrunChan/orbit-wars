@@ -588,7 +588,7 @@ def agent(obs):
     # 2P uses "starter" — 1v1 the model is calibrated and helps.
     sim_opp_model = "none" if num_players == 4 else "starter"
     # v98: shorter sim horizon in 2P (faster decisions, more aggressive)
-    sim_horizon = 12 if num_players == 2 else SIM_HORIZON
+    sim_horizon = 10 if num_players == 2 else SIM_HORIZON
     sim_state_base = sim.make_state_from_obs(obs)
     baseline_state = sim.clone(sim_state_base)
     baseline_eval = _simulate(baseline_state, [], [], sim_horizon, player,

@@ -601,7 +601,7 @@ def agent(obs):
 
     # Group candidates by (mid, tid). For each (mid, tid), present both
     # variants (min and buffered) and let sim pick whichever — or neither.
-    K = min(15, len(candidates))
+    K = min(18 if num_players == 2 else 15, len(candidates))
     grouped = {}
     for c in candidates[:K]:
         key = (c[1], c[2])  # (mid, tid)
