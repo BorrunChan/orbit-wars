@@ -1,0 +1,56 @@
+#!/bin/bash
+# Pre-commit hook: smoke-test any changed agent file before allowing commit.
+#
+# Catches catastrophic regressions like v117 (0% bench vs structured).
+# Runs scripts/smoke_test.py on each changed agents/v*.py and main.py.
+#
+# Bypass (use sparingly, only for known-failure archival commits):
+#   git commit --no-verify
+#   or include "[ALLOW-FAIL]" anywhere in the commit message:
+#     git commit -m "v117 dead-end snapshot [ALLOW-FAIL]"
+
+set -e
+
+# Allow opt-out via commit message tag (read from COMMIT_EDITMSG if present)
+if [ -f .git/COMMIT_EDITMSG ] && grep -q "\[ALLOW-FAIL\]" .git/COMMIT_EDITMSG; then
+    echo "pre-commit: [ALLOW-FAIL] tag detected, skipping smoke tests."
+    exit 0
+fi
+
+# Find staged agent files
+changed=$(git diff --cached --name-only --diff-filter=AM | \
+          grep -E "^(main\.py|agents/v.*\.py)$" || true)
+
+if [ -z "$changed" ]; then
+    exit 0
+fi
+
+PY=".venv/bin/python"
+if [ ! -x "$PY" ]; then
+    PY="python"
+fi
+
+echo "pre-commit: smoke-testing $(echo "$changed" | wc -l | tr -d ' ') changed agent file(s)"
+
+fail_list=""
+for f in $changed; do
+    echo "----- $f -----"
+    if ! "$PY" scripts/smoke_test.py "$f"; then
+        fail_list="$fail_list $f"
+    fi
+done
+
+if [ -n "$fail_list" ]; then
+    echo ""
+    echo "❌ pre-commit BLOCKED: smoke test failed for:$fail_list"
+    echo ""
+    echo "Options:"
+    echo "  1. Fix the agent and re-commit"
+    echo "  2. Move dead-end experiment to agents/experimental/ first"
+    echo "  3. If intentionally committing a known-failure snapshot, add"
+    echo "     [ALLOW-FAIL] to the commit message:"
+    echo "       git commit -m 'archive v999 dead end [ALLOW-FAIL]'"
+    exit 1
+fi
+
+echo "✅ pre-commit: all smoke tests passed."
