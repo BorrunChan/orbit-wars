@@ -58,7 +58,8 @@
 - **Adaptive sim opp model (v115)** — 2P 47%→47% **identical to v98** (sim model 只改 absolute eval，relative delta 不变)
 - **Always high_volume sim model (v116)** — 2P 47%→47% **identical to v98** (同上 root cause)
 - **Bypass-sim pressure shots 5/mine (v117)** — 2P 47%→**0%** (同 v108/v111，drain)
-- → **结论：v98 在 2P 对 proto1000 的 0/6 是结构性的，15 个实验全失败**
+- **Sim-mediated coop attack — relaxed targeted lock (v125)** — 2P 46%→25% (structured 75%→50%, proto1000 17%→0%). 把 v98 的"一目标一击" binary lock 换成 `targeted_count` ≤ 2 (2P only) + K=20，让 sim greedy 自然挑第二源。第二源 sim 偶尔短期接受但浪费的兵换不回扩张缺口；structured 直接被打崩。比 v105 更"克制"仍 fail。**新发现**：6 seeds×2 pos 下 v124 vs proto1000 = 2/12 = 17%（不是 0%）—— 早期 0/6 是小样本不幸。
+- → **结论：v98 在 2P 对 proto1000 的 ~17% 是结构性的，16 个实验全失败**
 - → **v98 在 standard pool 是 absolute hard local optimum**，razor-edge：任何 +/- 1 launch 打破平衡
 - → **Sim opp model 不影响 candidate selection**（v115/v116 证明）— 只改 absolute eval，相对 delta 不变
 - → **replay-bot 测试集失败**：v98 vs 6 个真实 medium swarmer replay = 36/36 全胜（replay 不 reactive）
