@@ -18,7 +18,10 @@
 
 ## 项目快速上下文
 
-- **当前部署版本**：v98 (`main.py` = `agents/v98_horz2p.py`)
+- **当前部署版本**：v124 (`main.py` = `agents/v124_early_swarm.py`)
+  - v124 = v123 + 2P early-game max_launch floor (step 10-60, _n_total>=3, 25% floor)
+  - v123 vs v124 standard pool 2P bench: 21/30=70% 同分 (trigger 不触发本地)
+  - Kaggle 期望: 在真 swarmer 局 (fell_behind@10-30) 早期解锁兵力，覆盖 v123 trigger 来不及的窗口
 - **Kaggle 段位**：800-1070 波动
 - **本地 bench 基准**：4P 32%, 2P 47%
 - **比赛截止**：2026-06-23 23:59 UTC
