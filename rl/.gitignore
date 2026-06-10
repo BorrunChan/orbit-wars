@@ -1,0 +1,5 @@
+data/
+_build/
+*.tar.gz
+__pycache__/
+*.pyc
