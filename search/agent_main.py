@@ -83,6 +83,13 @@ class ProducerLiteConfig:
     hoard_min_planets: int = 0
     hoard_roi_mult: float = 1.0      # multiply roi_threshold when hoarding
     hoard_max_waves: int = 0         # cap waves when hoarding (0 = unchanged)
+    # --- continuous dynamic control (ported from light-ver 1200) -------------
+    # CONTINUOUS strength-ratio -> roi/waves (no hard thresholds, never freezes).
+    # behind -> lower roi (attack harder to catch up) via quadratic deficit curve.
+    enable_dynamic_roi: bool = False
+    # late-game candidate suppression: kill attacks that arrive too late to pay
+    # off + depreciate late neutrals (reduce end-game ship waste).
+    enable_late_suppress: bool = False
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
@@ -307,6 +314,13 @@ def plan_lite_waves(
     cand_is_def = torch.cat([p[7] for p in tier_parts], dim=0)
     score = torch.cat([p[8] for p in tier_parts], dim=0)
 
+    if bool(getattr(config, "enable_late_suppress", False)):
+        _step = int(obs_tensors["step"].reshape(-1)[0].item())
+        score = _suppress_late_candidates(
+            score=score, obs=obs, target_idx=target_idx, cand_tgt_short=cand_tgt_short,
+            cand_is_def=cand_is_def, cand_eta=cand_eta, step=_step, player_id=pid,
+        )
+
     wave_entries, leftover = _greedy_select(
         P=P, W=W, device=device, dtype=dtype, score=score,
         cand_src=cand_src, cand_send=cand_send, cand_angle=cand_angle, cand_eta=cand_eta,
@@ -340,6 +354,69 @@ def _apply_hoard_config(config: ProducerLiteConfig, owned_planets: int) -> Produ
     return dataclasses.replace(config, **repl) if repl else config
 
 
+def _owner_strength(obs, prod: Tensor, player_count: int) -> Tensor:
+    """Per-owner production + 2.5% ships as strength proxy. [player_count]"""
+    device = obs.device
+    dtype = obs.ships.dtype
+    strength = torch.zeros(int(player_count), dtype=dtype, device=device)
+    owner = obs.owner_abs.to(torch.long)
+    prod_v = prod.to(dtype)
+    ships = obs.ships.to(dtype)
+    for oid in range(int(player_count)):
+        mask = obs.alive & (owner == oid)
+        if bool(mask.any()):
+            strength[oid] = prod_v[mask].sum() + 0.025 * ships[mask].sum()
+    return strength
+
+
+def _adjust_config(config, obs, prod, step: int, player_count: int):
+    """CONTINUOUS strength-ratio -> roi/waves (no hard thresholds). Behind ->
+    lower roi (attack harder) via quadratic deficit curve + late-game urgency."""
+    pid = int(obs.player_id)
+    strength = _owner_strength(obs, prod, int(player_count))
+    if pid < 0 or pid >= int(player_count) or strength.numel() == 0:
+        return config
+    my = float(strength[pid].item()); leader = float(strength.max().item())
+    ratio = my / max(leader, 1e-6)
+    if ratio < 1.0:
+        deficit = 1.0 - ratio
+        roi_drop = 0.25 * deficit * deficit
+        new_roi = max(1.10, float(config.roi_threshold) - roi_drop)
+        remaining = TOTAL_STEPS - int(step)
+        if remaining < 150 and ratio < 0.90:
+            urgency = (150 - remaining) / 150.0
+            new_roi = max(1.10, new_roi - 0.10 * urgency * deficit)
+        config = dataclasses.replace(config, roi_threshold=new_roi)
+    waves = int(config.max_waves_per_turn)
+    if ratio < 0.70:
+        waves = min(8, waves + 1)
+    if (TOTAL_STEPS - int(step)) < 100 and ratio < 0.95:
+        waves = min(8, waves + 1)
+    if waves != int(config.max_waves_per_turn):
+        config = dataclasses.replace(config, max_waves_per_turn=waves)
+    return config
+
+
+def _suppress_late_candidates(*, score, obs, target_idx, cand_tgt_short, cand_is_def,
+                              cand_eta, step: int, player_id: int):
+    """Last 120 turns: kill attacks arriving too late to pay off; depreciate late neutrals."""
+    remaining = TOTAL_STEPS - int(step)
+    if remaining > 120 or int(obs.P) <= 0 or score.numel() == 0:
+        return score
+    device = score.device; dtype = score.dtype; pid = int(player_id); P = int(obs.P)
+    tgt_abs = target_idx[cand_tgt_short].clamp(0, P - 1)
+    tgt_owner = obs.owner_abs.to(device=device)[tgt_abs].long()
+    eta = cand_eta.reshape(score.shape).to(device=device, dtype=dtype)
+    is_neutral = tgt_owner < 0
+    is_enemy = (tgt_owner >= 0) & (tgt_owner != pid) & (~cand_is_def)
+    neutral_margin = max(1.0, float(remaining) - 8.0)
+    enemy_margin = max(1.0, float(remaining) - 4.0)
+    too_late = (is_neutral & (eta > neutral_margin)) | (is_enemy & (eta > enemy_margin))
+    neutral_factor = ((float(remaining) - eta) / max(1.0, 80.0)).clamp(min=0.20, max=1.0)
+    score = torch.where(is_neutral, score * neutral_factor, score)
+    return torch.where(too_late, torch.full_like(score, float("-inf")), score)
+
+
 def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int, memory) -> dict:
     device = obs_tensors["planets"].device
     obs = parse_obs(obs_tensors)
@@ -354,6 +431,9 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
         cached_movement=getattr(memory, "movement", None),
     )
     memory.movement = movement
+    if bool(getattr(config, "enable_dynamic_roi", False)):
+        _step = int(obs_tensors["step"].reshape(-1)[0].item())
+        config = _adjust_config(config, obs, movement.planet_prod, _step, int(player_count))
     cache = build_distance_cache(movement, max_k=int(config.horizon))
     H = int(config.horizon)
     status = movement.garrison_status(max_horizon=H)
