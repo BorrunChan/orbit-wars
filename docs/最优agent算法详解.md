@@ -1,6 +1,7 @@
-# Orbit Wars 当前最优 agent —— 完整算法详解（从零）
+# Orbit Wars 当前最优 agent `rmargin` —— 完整算法详解（从零）
 
-> 对应我们当前 Kaggle **public 1247.0**（最高提交 ref 53704199，代码在 `external/reyhan/`，引擎包 `orbit_lite/`）。
+> **命名 `rmargin`**（reinforcement margin，增援余量版）。对应我们当前 Kaggle **public ~1245**（1241–1247，最高提交 ref 53704199，代码 `external/reyhan/` + 参数化副本 `search/agent_main.py`，引擎包 `orbit_lite/`）。
+> 衍生 `rmargin-hoard`（+ 显式屯兵旋钮，ref 53730874）实测 = 1245 持平、无增益（§6）。
 > 本文**自包含、从零讲**：游戏规则 → 状态表示 → 每回合如何决策 → 评分 → 配置 → 为何强。不假设读者了解任何先前版本。
 
 ---
@@ -114,7 +115,7 @@ floor = ceil(守军 + overhead + reinforcement)
 3. **长局靠兵力计分赢**：因为 score 含兵力，攒下的大舰队在长局碾压。
 4. 这比"清空星球猛攻"(safe_drain 全抽) 的朴素 producer 高 ~65（后者站场兵力低、长局吃亏，卡 ~1180）。
 
-**注意（已实测的反例）**：在它之上加"到 N 星就抬 roi 停手"的**显式屯兵规则会 backfire**（冻死扩张，像旧 v111）。正确的"屯"是**降低浪费**自然涌现，而非"停手攒兵"。
+**注意（已实测的反例 `rmargin-hoard`）**：在 `rmargin` 之上加"owned≥N 星就抬 roi 停手"的**显式屯兵规则**（ref 53730874）。猛档 backfire（冻死扩张，像旧 v111：一局只剩 1 星）、温和档 no-op（Kaggle 1245 = `rmargin` 持平）。正确的"屯"是 config 层**降低浪费**自然涌现，而非"停手攒兵"。
 
 ---
 
@@ -129,7 +130,7 @@ floor = ceil(守军 + overhead + reinforcement)
 ## 8. 代码地图
 
 ```
-external/reyhan/main.py        # 本 agent（参数化引擎，读 params.json）
+external/reyhan/main.py        # rmargin 本体（= search/agent_main.py 参数化引擎，读 params.json）
 external/reyhan/params.json    # 上表的 2P/4P 配置
 orbit_lite/                    # 引擎包：
   movement.py                  #   轨道缓存 + do-nothing 投影 garrison_status
