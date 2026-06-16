@@ -1,0 +1,8 @@
+{
+  "config_2p": {"horizon": 18, "max_waves_per_turn": 7, "roi_threshold": 1.5, "min_ships_to_launch": 4.0,
+                "max_offensive_targets": 12, "max_regroup_targets_per_source": 7, "max_regroup_time": 7.0,
+                "reinforce_size_beta": 0.0, "size_multipliers": [0.5, 0.75, 1.0]},
+  "config_4p": {"horizon": 13, "max_waves_per_turn": 7, "roi_threshold": 1.5, "min_ships_to_launch": 5.0,
+                "max_offensive_targets": 7, "max_sources_per_lane": 6, "max_regroup_targets_per_source": 8,
+                "max_regroup_time": 6.0, "reinforce_size_beta": 0.0, "size_multipliers": [0.5, 0.75, 1.0]}
+}

@@ -1,0 +1,7 @@
+_cand/
+_build/
+h2h/
+*.tar.gz
+results*.json
+__pycache__/
+*.pyc
