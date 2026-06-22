@@ -190,6 +190,18 @@ class ProducerLiteConfig:
     # (base still contests strong enemy planets, but defers marginal enemy attacks
     # to the 四计 precision strikes). Lets the producer base co-exist with tactics.
     vulture_penalty: float = 0.0
+    # --- 僵局破局: 学 Kaggle/Xander 主流多路并发 (75-86% 对局达 8+ 并发舰) ---------
+    # 中立扩张饱和 + 扩张停滞 = 屯兵僵局. 触发: 降 roi + 提 waves + 放宽 capture_floor
+    # 试探(进攻多路突破) + 降回防门槛(防守抗多路). safe_drain 仍护守军, 僵局专属避 v108.
+    enable_stalemate_break: bool = True
+    stalemate_min_step: int = 70
+    stalemate_stall_turns: int = 15
+    stalemate_min_planets: int = 4
+    stalemate_roi: float = 1.05
+    stalemate_waves: int = 10
+    capture_overhead: float = 1.0
+    stalemate_capture_overhead: float = 0.9
+    stalemate_regroup_delta: float = 0.15
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
@@ -429,7 +441,7 @@ def plan_lite_waves(
         reinforcement = beta * rho.view(1, K_eta) * enemy_mass_t.view(T, 1)
     floor = capture_floor(
         garrison_status, target_idx=target_idx, k_max=K_eta,
-        capture_overhead=1.0, player_id=pid, reinforcement=reinforcement,
+        capture_overhead=float(getattr(config, "capture_overhead", 1.0)), player_id=pid, reinforcement=reinforcement,
     )
 
     tier_parts = [
@@ -537,6 +549,34 @@ def _apply_hoard_config(config: ProducerLiteConfig, owned_planets: int) -> Produ
     if int(config.hoard_max_waves) > 0:
         repl["max_waves_per_turn"] = int(config.hoard_max_waves)
     return dataclasses.replace(config, **repl) if repl else config
+
+
+def _apply_stalemate_config(config: ProducerLiteConfig, obs, *, step: int, player_count: int, memory) -> ProducerLiteConfig:
+    """中立扩张饱和 + 扩张停滞的僵局 → 多路并发: 降 roi/提 waves/放宽 floor 试探 + 降回防门槛.
+    扩张停滞用 memory 跟踪(owned 创新高清零, 否则 +1). 只 2P. 学 Kaggle 主流多路压制破僵局."""
+    if not bool(getattr(config, "enable_stalemate_break", False)) or int(player_count) >= 4:
+        return config
+    owned = int(obs.owned.sum().item())
+    if owned > int(getattr(memory, "peak_owned", 0)):
+        memory.peak_owned = owned
+        memory.stall_steps = 0
+    else:
+        memory.stall_steps = int(getattr(memory, "stall_steps", 0)) + 1
+    if int(step) < int(config.stalemate_min_step) or owned < int(config.stalemate_min_planets):
+        return config
+    if int(getattr(memory, "stall_steps", 0)) < int(config.stalemate_stall_turns):
+        return config
+    enemy = obs.alive & (~obs.owned) & (obs.owner_abs >= 0)
+    if not bool(enemy.any()):
+        return config
+    return dataclasses.replace(
+        config,
+        roi_threshold=float(config.stalemate_roi),
+        max_waves_per_turn=max(int(config.max_waves_per_turn), int(config.stalemate_waves)),
+        hoard_min_planets=0,
+        capture_overhead=float(config.stalemate_capture_overhead),
+        regroup_pressure_delta_min=float(config.stalemate_regroup_delta),
+    )
 
 
 def _owner_strength(obs, prod: Tensor, player_count: int) -> Tensor:
@@ -1149,6 +1189,10 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
     if P == 0:
         return empty_action_row(device)
     config = _apply_hoard_config(config, int(obs.owned.sum().item()))
+    config = _apply_stalemate_config(
+        config, obs, step=int(obs_tensors["step"].reshape(-1)[0].item()),
+        player_count=int(player_count), memory=memory,
+    )
 
     movement = ensure_planet_movement(
         obs_tensors=obs_tensors,
@@ -1265,11 +1309,15 @@ class ProducerLiteMemory:
         self.movement = None
         self.cached_player_count: int | None = None
         self.last_sparse_action_row: dict | None = None
+        self.peak_owned: int = 0
+        self.stall_steps: int = 0
 
     def reset(self) -> None:
         self.movement = None
         self.cached_player_count = None
         self.last_sparse_action_row = None
+        self.peak_owned = 0
+        self.stall_steps = 0
 
 
 class ProducerLiteRuntime:
@@ -1283,6 +1331,8 @@ class ProducerLiteRuntime:
         mem = self.memory
         if bool((obs_tensors["step"] == 0).all()):
             mem.cached_player_count = None
+            mem.peak_owned = 0
+            mem.stall_steps = 0
         if mem.cached_player_count is None:
             mem.cached_player_count = largest_initial_player_count(obs_tensors)
         current_player = int(obs_tensors["player"].reshape(-1)[0].item())

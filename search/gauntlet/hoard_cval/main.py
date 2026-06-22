@@ -96,6 +96,19 @@ class ProducerLiteConfig:
     opportunist_max_garrison: float = 15.0
     enable_chenghuo: bool = True      # 趁火: 打被第三方攻击的敌星 — 连招默认开
     chenghuo_boost: float = 1.5
+    # --- 僵局破局: 学 Kaggle/Xander 主流多路并发打法 (75-86% 对局达 8+ 并发舰) ----
+    # 中立扩张饱和 + 我方扩张停滞 = 屯兵僵局(Xander 局根因). 此时 roi 门槛让"打敌星"
+    # 的兵发不出去 → 静态挨打. 触发后降 roi(边际攻击也发) + 提 waves(多路并发) 主动
+    # 打敌星薄弱点破局. 只动 roi/waves: capture_floor + safe_drain 仍保证不发送死兵.
+    enable_stalemate_break: bool = True
+    stalemate_min_step: int = 70       # 过早期扩张后才考虑 (早期照常扩张)
+    stalemate_stall_turns: int = 15    # 连续 N 步 owned 无新增 = 扩张停滞/僵局
+    stalemate_min_planets: int = 4     # 有产能基础(多源)才多路, 否则保守扩张
+    stalemate_roi: float = 1.05        # 破局降发兵门槛 (僵局打敌星 roi 难过默认 1.5)
+    stalemate_waves: int = 10          # 破局多路并发波数 (默认 7)
+    capture_overhead: float = 1.0      # 攻星安全系数 (1.0=刚好够, <1=冒险试探打不下也发)
+    stalemate_capture_overhead: float = 0.9  # 破局放宽: 真·多路试探(差一点也发,学Xander突破)
+    stalemate_regroup_delta: float = 0.15    # 破局降回防门槛 (小威胁也回防, 抗多路并发)
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
@@ -504,7 +517,7 @@ def plan_lite_waves(
         reinforcement = beta * rho.view(1, K_eta) * enemy_mass_t.view(T, 1)
     floor = capture_floor(
         garrison_status, target_idx=target_idx, k_max=K_eta,
-        capture_overhead=1.0, player_id=pid, reinforcement=reinforcement,
+        capture_overhead=float(getattr(config, "capture_overhead", 1.0)), player_id=pid, reinforcement=reinforcement,
     )
 
     tier_parts = [
@@ -591,6 +604,37 @@ def _apply_hoard_config(config: ProducerLiteConfig, owned_planets: int) -> Produ
     return dataclasses.replace(config, **repl) if repl else config
 
 
+def _apply_stalemate_config(config: ProducerLiteConfig, obs, *, step: int, player_count: int, memory) -> ProducerLiteConfig:
+    """中立扩张饱和 + 扩张停滞的僵局 → 切多路并发打敌星 (降 roi + 提 waves).
+
+    扩张停滞用 memory 跟踪: owned 创新高则清零停滞计数, 否则 +1. 连续 stall_turns 步无
+    新增星 = 僵局. 学 Kaggle 主流: 与其屯兵静态挨打, 不如主动多路压制敌星薄弱点破局.
+    只在 2P (4P prod-only 且难屯到僵局, 另路由 default). 关 hoard 抬价以免互相抵消."""
+    if not bool(getattr(config, "enable_stalemate_break", False)) or int(player_count) >= 4:
+        return config
+    owned = int(obs.owned.sum().item())
+    if owned > int(getattr(memory, "peak_owned", 0)):
+        memory.peak_owned = owned
+        memory.stall_steps = 0
+    else:
+        memory.stall_steps = int(getattr(memory, "stall_steps", 0)) + 1
+    if int(step) < int(config.stalemate_min_step) or owned < int(config.stalemate_min_planets):
+        return config
+    if int(getattr(memory, "stall_steps", 0)) < int(config.stalemate_stall_turns):
+        return config
+    enemy = obs.alive & (~obs.owned) & (obs.owner_abs >= 0)   # 有敌方星才值得破局
+    if not bool(enemy.any()):
+        return config
+    return dataclasses.replace(
+        config,
+        roi_threshold=float(config.stalemate_roi),
+        max_waves_per_turn=max(int(config.max_waves_per_turn), int(config.stalemate_waves)),
+        hoard_min_planets=0,   # 破局时关 hoard, 别再抬 roi 屯兵
+        capture_overhead=float(config.stalemate_capture_overhead),  # 进攻: 放宽试探多路突破
+        regroup_pressure_delta_min=float(config.stalemate_regroup_delta),  # 防守: 小威胁也回防
+    )
+
+
 def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int, memory) -> dict:
     device = obs_tensors["planets"].device
     obs = parse_obs(obs_tensors)
@@ -598,6 +642,10 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
     if P == 0:
         return empty_action_row(device)
     config = _apply_hoard_config(config, int(obs.owned.sum().item()))
+    config = _apply_stalemate_config(
+        config, obs, step=int(obs_tensors["step"].reshape(-1)[0].item()),
+        player_count=int(player_count), memory=memory,
+    )
 
     movement = ensure_planet_movement(
         obs_tensors=obs_tensors,
@@ -688,11 +736,15 @@ class ProducerLiteMemory:
         self.movement = None
         self.cached_player_count: int | None = None
         self.last_sparse_action_row: dict | None = None
+        self.peak_owned: int = 0
+        self.stall_steps: int = 0
 
     def reset(self) -> None:
         self.movement = None
         self.cached_player_count = None
         self.last_sparse_action_row = None
+        self.peak_owned = 0
+        self.stall_steps = 0
 
 
 class ProducerLiteRuntime:
@@ -706,6 +758,8 @@ class ProducerLiteRuntime:
         mem = self.memory
         if bool((obs_tensors["step"] == 0).all()):
             mem.cached_player_count = None
+            mem.peak_owned = 0
+            mem.stall_steps = 0
         if mem.cached_player_count is None:
             mem.cached_player_count = largest_initial_player_count(obs_tensors)
         current_player = int(obs_tensors["player"].reshape(-1)[0].item())
