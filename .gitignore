@@ -27,6 +27,8 @@ value_4p_model.py
 checkpoints/
 replays/
 archive/
+# Raw episode replay downloads (large, not tracked)
+1/
 
 # Opponent-bot weight artifacts (e.g. mlhybrid drops weights.npz on disk)
 weights.npz
