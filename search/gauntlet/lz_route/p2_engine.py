@@ -156,6 +156,10 @@ class ProducerLiteConfig:
     # opportunity even when just under the ROI bar. off by default.
     enable_comet: bool = False
     comet_prod_bonus: float = 4.0
+    # 2P 彗星离场前纯保兵(金蝉脱壳): 占领的彗星即将消失时撤全兵回最近可达友星, 不打敌
+    # (高分实证彗星打敌收益差, 2P 只需保住彗星上的兵不白丢, 不需价值评估/跳板/打敌)
+    enable_comet_save: bool = True
+    comet_save_remaining: int = 7
     enable_opportunist: bool = False
     opportunist_max_garrison: float = 15.0
     opportunist_boost: float = 1.5
@@ -1100,7 +1104,72 @@ def _plan_evacuation(*, movement, obs, obs_tensors, cache, config, protected=Non
     return LaunchEntries(
         source_slots=src_t, target_slots=dst_t, ships=ships_t,
         angle=aim["angle"].reshape(-1), eta=aim["eta"].reshape(-1),
-        valid=torch.ones(len(ev_src), dtype=torch.bool, device=device),
+        valid=aim["viable"].reshape(-1),   # 修撞太阳 bug: 用 viable 而非 ones
+    )
+
+
+def _comet_save_garrison(movement, obs, obs_tensors, cache, config):
+    """2P 彗星离场前纯保兵(金蝉脱壳): 占领的彗星即将消失时撤全兵回最近可达友星, 不打敌.
+    高分实证彗星打敌收益差, 2P 只需保住彗星上的兵不白丢, 不做价值评估/跳板/打敌."""
+    P = int(obs.P); device = obs.device; dtype = obs.ships.dtype
+    comets = obs_tensors.get("comets")
+    if not isinstance(comets, dict) or P == 0:
+        return _empty_entries(device, dtype)
+    pidx = comets.get("path_index"); paths = comets.get("paths"); cpids = comets.get("planet_ids")
+    if pidx is None or paths is None or cpids is None:
+        return _empty_entries(device, dtype)
+    urgent = set()
+    for e in range(int(pidx.shape[0])):
+        pe = int(pidx[e].item())
+        if pe < 0:
+            continue
+        path = paths[e, 0]
+        moving = (path[1:] - path[:-1]).abs().sum(-1) > 1e-3
+        plen = int(moving.sum().item()) + 1
+        if plen - pe <= int(config.comet_save_remaining):      # 即将离场
+            for c in cpids[e].tolist():
+                if c >= 0:
+                    urgent.add(int(c))
+    if not urgent:
+        return _empty_entries(device, dtype)
+    pl_ids = obs_tensors["planets"][..., 0].long().reshape(-1)
+    urgent_mask = torch.zeros(P, dtype=torch.bool, device=device)
+    for i in range(P):
+        if int(pl_ids[i].item()) in urgent:
+            urgent_mask[i] = True
+    src_mask = obs.owned & obs.alive & urgent_mask & (obs.ships >= float(config.min_ships_to_launch))
+    friend = obs.owned & obs.alive
+    fr_idx = friend.nonzero(as_tuple=False).squeeze(1)
+    if not bool(src_mask.any()) or int(fr_idx.numel()) == 0:
+        return _empty_entries(device, dtype)
+    d0 = cache.cross_dist[0].to(dtype)
+    src_list = src_mask.nonzero(as_tuple=False).squeeze(1)
+    Ns = int(src_list.numel()); Nf = int(fr_idx.numel())
+    src_ships = obs.ships.to(dtype)[src_list]
+    aimF = intercept_angle(movement, src_list.view(Ns, 1), fr_idx.view(1, Nf),
+                           src_ships.view(Ns, 1).expand(Ns, Nf))
+    viableF = aimF["viable"].reshape(Ns, Nf)
+    ev_s = []; ev_d = []; ev_n = []
+    for row, s in enumerate(src_list.tolist()):
+        n = float(int(obs.ships[s].item()))
+        if n < float(config.min_ships_to_launch):
+            continue
+        frow = viableF[row] & (fr_idx != s)                    # 可达(不撞太阳)的友星
+        if not bool(frow.any()):
+            continue
+        cand_fi = fr_idx[frow]
+        best = int(cand_fi[int(d0[s, cand_fi].argmin().item())].item())  # 最近友星
+        ev_s.append(s); ev_d.append(best); ev_n.append(n)
+    if not ev_s:
+        return _empty_entries(device, dtype)
+    src_t = torch.tensor(ev_s, dtype=torch.long, device=device)
+    dst_t = torch.tensor(ev_d, dtype=torch.long, device=device)
+    ships_t = torch.tensor(ev_n, dtype=dtype, device=device)
+    aim = intercept_angle(movement, src_t, dst_t, ships_t)
+    return LaunchEntries(
+        source_slots=src_t, target_slots=dst_t, ships=ships_t,
+        angle=aim["angle"].reshape(-1), eta=aim["eta"].reshape(-1),
+        valid=aim["viable"].reshape(-1),
     )
 
 
@@ -1237,6 +1306,10 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
         evac_entries = _plan_evacuation(movement=movement, obs=obs, obs_tensors=obs_tensors, cache=cache, config=config, protected=protected)
         # evac first = priority: doomed garrisons leave before being double-spent
         entries = concat_launch_entries([evac_entries, entries])
+    if bool(getattr(config, "enable_comet_save", False)):
+        save_entries = _comet_save_garrison(movement, obs, obs_tensors, cache, config)
+        if save_entries is not None and save_entries.valid is not None and bool(save_entries.valid.any()):
+            entries = concat_launch_entries([save_entries, entries])   # 2P 彗星离场保兵
     entries = disambiguate_duplicate_launches(entries)
     launches = infer_planned_launches_from_entries(
         obs_tensors=obs_tensors, movement=movement, entries=entries, player_id=int(obs.player_id),
