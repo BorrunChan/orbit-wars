@@ -109,6 +109,15 @@ class ProducerLiteConfig:
     capture_overhead: float = 1.0      # 攻星安全系数 (1.0=刚好够, <1=冒险试探打不下也发)
     stalemate_capture_overhead: float = 0.9  # 破局放宽: 真·多路试探(差一点也发,学Xander突破)
     stalemate_regroup_delta: float = 0.15    # 破局降回防门槛 (小威胁也回防, 抗多路并发)
+    # --- 出逃保兵 (金蝉脱壳 + 围魏救赵): 被集火打崩的星, 撤全兵保实力 + 反打攻击者 ----
+    # 已抽干的源星(它把兵都发来打我了, 正好反打它空虚的本星). 留得青山在不怕没柴烧.
+    # 支线A 实证 4P +6(唯一正收益旋钮). 只撤"连后方增援都救不了"的真·守不住星.
+    enable_evacuation: bool = False
+    evac_min_ships: float = 10.0
+    evac_horizon: int = 10
+    evac_max_waves: int = 4
+    evac_counterstrike: bool = True
+    evac_counter_margin: float = 1.25
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
@@ -635,6 +644,105 @@ def _apply_stalemate_config(config: ProducerLiteConfig, obs, *, step: int, playe
     )
 
 
+def _plan_evacuation(*, movement, obs, obs_tensors, cache, config, protected=None):
+    """守不住的星出逃保兵(金蝉脱壳)+ 优先反打攻击者已抽干的源星(围魏救赵).
+    被多家集火打崩时撤全兵保实力, 留得青山在不怕没柴烧. 只撤"连后方增援都救不了"的真·守不住星."""
+    P = int(obs.P); device = obs.device; dtype = obs.ships.dtype; pid = int(obs.player_id)
+    if P == 0:
+        return _empty_entries(device, dtype)
+    owned = obs.owned & obs.alive
+    if not bool(owned.any()):
+        return _empty_entries(device, dtype)
+    Hreq = int(config.evac_horizon)
+    H = min(Hreq, int(movement.garrison_status(max_horizon=Hreq).ships.shape[-1]) - 1)
+    if H <= 0:
+        return _empty_entries(device, dtype)
+    status = movement.garrison_status(max_horizon=H)
+    if getattr(status, "owner", None) is not None:
+        falls = status.owner[:, 1:] != pid                          # owner-flip = 将易主
+    else:
+        falls = status.ships[:, 1:] <= 0.5
+    will_fall = owned & falls.any(dim=-1)
+    fall_step = falls.float().argmax(dim=-1) + 1
+    d0 = cache.cross_dist[0].to(dtype)
+    cand = will_fall & (obs.ships >= float(config.evac_min_ships))
+    if protected is not None:
+        cand = cand & ~protected
+    ships_f = obs.ships.to(dtype)
+    abo = getattr(status, "arrivals_by_owner", None)
+    doomed = torch.zeros(P, dtype=torch.bool, device=device)
+    for p in cand.nonzero(as_tuple=False).squeeze(1).tolist():
+        fs = int(fall_step[p].item())
+        if abo is not None:
+            inc = float(abo[p, 1:fs + 1, :].sum().item() - abo[p, 1:fs + 1, pid].sum().item())
+        else:
+            inc = float(ships_f[p].item()) + 1.0
+        others = owned.clone(); others[p] = False
+        oi = others.nonzero(as_tuple=False).squeeze(1)
+        reinf = 0.0
+        if oi.numel() > 0:
+            sp = fleet_speed(ships_f[oi].clamp(min=1.0))
+            eta_r = (d0[oi, p] / sp.clamp(min=1e-6)).ceil()
+            reinf = float(ships_f[oi][eta_r < float(fs)].sum().item())
+        if float(ships_f[p].item()) + reinf < inc:                  # 增援也救不了 = 真·守不住
+            doomed[p] = True
+    safe = owned & ~will_fall
+    if not bool(doomed.any()) or (not bool(safe.any()) and not bool(config.evac_counterstrike)):
+        return _empty_entries(device, dtype)
+    src_idx = doomed.nonzero(as_tuple=False).squeeze(1)
+    safe_idx = safe.nonzero(as_tuple=False).squeeze(1)
+    # 围魏 targets: 攻击者已抽干的源星 (in-flight 敌方 fleet 的 from_planet_id)
+    counter_mask = torch.zeros(P, dtype=torch.bool, device=device)
+    if bool(config.evac_counterstrike):
+        f = obs_tensors.get("fleets")
+        if f is not None and f.numel() > 0:
+            f = f.reshape(-1, f.shape[-1])
+            vmask = (f[:, 6] > 0.5) & (f[:, 1].long() != pid) & (f[:, 1].long() >= 0)
+            if bool(vmask.any()):
+                counter_mask[f[:, 5].long().clamp(0, P - 1)[vmask]] = True
+        counter_mask &= (obs.owner_abs >= 0) & (obs.owner_abs != float(pid)) & obs.alive
+    counter_idx = counter_mask.nonzero(as_tuple=False).squeeze(1) if bool(counter_mask.any()) else None
+    ev_src = []; ev_dst = []; ev_ships = []
+    for s_i in range(int(src_idx.shape[0])):
+        if len(ev_src) >= int(config.evac_max_waves):
+            break
+        s = int(src_idx[s_i].item())
+        gs = float(obs.ships[s].item())
+        fs = int(fall_step[s].item())
+        speed = float(fleet_speed(torch.tensor(max(gs, 1.0), dtype=dtype, device=device)))
+        dst = None
+        # 1+2 联动: 优先反打攻击者已抽干的源星 (撤退即反击)
+        if counter_idx is not None and counter_idx.numel() > 0:
+            cd = d0[s, counter_idx]
+            ceta = (cd / max(speed, 1e-6)).ceil()
+            win = (gs > obs.ships.to(dtype)[counter_idx] * float(config.evac_counter_margin)) & (ceta <= float(H)) & (counter_idx != s)
+            if bool(win.any()):
+                cb = int(torch.where(win, cd, torch.full_like(cd, 1e9)).argmin().item())
+                dst = int(counter_idx[cb].item())
+        # fallback: 金蝉脱壳 撤到最近且赶得及的安全友星
+        if dst is None and safe_idx.numel() > 0:
+            dists = d0[s, safe_idx]
+            etas = (dists / max(speed, 1e-6)).ceil()
+            valid = (etas < float(fs + 1)) & (safe_idx != s)
+            if bool(valid.any()):
+                best = int(torch.where(valid, dists, torch.full_like(dists, 1e9)).argmin().item())
+                dst = int(safe_idx[best].item())
+        if dst is None:
+            continue
+        ev_src.append(s); ev_dst.append(dst); ev_ships.append(gs)
+    if not ev_src:
+        return _empty_entries(device, dtype)
+    src_t = torch.tensor(ev_src, dtype=torch.long, device=device)
+    dst_t = torch.tensor(ev_dst, dtype=torch.long, device=device)
+    ships_t = torch.tensor(ev_ships, dtype=dtype, device=device)
+    aim = intercept_angle(movement, src_t, dst_t, ships_t)
+    return LaunchEntries(
+        source_slots=src_t, target_slots=dst_t, ships=ships_t,
+        angle=aim["angle"].reshape(-1), eta=aim["eta"].reshape(-1),
+        valid=aim["viable"].reshape(-1),   # 修撞太阳 bug: 用 viable 而非 ones (出逃也不穿太阳)
+    )
+
+
 def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int, memory) -> dict:
     device = obs_tensors["planets"].device
     obs = parse_obs(obs_tensors)
@@ -663,6 +771,17 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
         garrison_status=status, prod=movement.planet_prod,
         alive_by_step=alive_by_step, config=config, player_count=int(player_count),
     )
+    if bool(getattr(config, "enable_evacuation", False)):
+        protected = torch.zeros(int(obs.P), dtype=torch.bool, device=device)
+        vmask = getattr(entries, "valid", None)
+        for fld in ("target_slots", "source_slots"):   # producer 正在发兵的星别撤
+            sl = getattr(entries, fld, None)
+            if sl is not None and sl.numel() > 0:
+                sel = sl[vmask] if (vmask is not None and vmask.shape == sl.shape) else sl.reshape(-1)
+                if sel.numel() > 0:
+                    protected[sel.reshape(-1).clamp(0, int(obs.P) - 1)] = True
+        evac_entries = _plan_evacuation(movement=movement, obs=obs, obs_tensors=obs_tensors, cache=cache, config=config, protected=protected)
+        entries = concat_launch_entries([evac_entries, entries])   # 出逃优先: 守不住的兵先撤
     entries = disambiguate_duplicate_launches(entries)
     launches = infer_planned_launches_from_entries(
         obs_tensors=obs_tensors, movement=movement, entries=entries, player_id=int(obs.player_id),
@@ -683,6 +802,7 @@ CONFIG_4P = dataclasses.replace(
     max_regroup_time=6.0,
     regroup_pressure_delta_min=0.25,
     max_regroup_targets_per_source=8,
+    enable_evacuation=True,   # 4P 出逃保兵 (支线A +6 唯一正收益): 被集火打崩→撤全兵反打敌后
 )
 
 
