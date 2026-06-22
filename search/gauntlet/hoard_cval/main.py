@@ -91,6 +91,7 @@ class ProducerLiteConfig:
     comet_reach: float = 30.0        # 彗星轨迹点到目标的可达距离(够近才算够得到打)
     comet_value_window: int = 18     # 看未来多少步轨迹
     comet_value_threshold: float = 2.0  # 轨迹可达目标的加权价值(prod/守军) >= 此值才占
+    comet_attack_min_prod: float = 4.0  # 彗星清仓打敌的最低 prod 门槛: 向高分看齐(>1200 仅18%打敌76%回援) —— 瘦敌星(prod<4)不打改回援保兵, 只打肥敌
     enable_opportunist: bool = True   # 欲擒: 打弱守强敌(彗星投送敌后配此最佳) — 连招默认开
     opportunist_boost: float = 1.5
     opportunist_max_garrison: float = 15.0
@@ -298,9 +299,9 @@ def _comet_clearance(movement, obs, obs_tensors, cache, config, prod):
         n = float(int(obs.ships[s].item()))                # 全 garrison, 整数
         if n < float(config.min_ships_to_launch):
             continue
-        # 优先: 全兵能打下 且 路径不撞太阳(viable) 的目标里 prod 最高(价值最大);
-        # 都打不下/全被太阳挡: 撤到最近且可达(不撞太阳)的友星保兵(而非全兵送死/撞太阳)
-        winnable = (tgt_ships * 1.1 < n) & (tgt_idx != s) & viableT[row]
+        # 向高分看齐(>1200 仅18%打敌76%回援): 只打"能打下+不撞太阳+prod够肥(≥门槛)"的敌星;
+        # 瘦敌星(prod<门槛, 占我方彗星打敌大头)不打 → 落入下方撤友星回援保兵(兵力调度而非强袭瘦敌)
+        winnable = (tgt_ships * 1.1 < n) & (tgt_idx != s) & viableT[row] & (tgt_prod >= float(config.comet_attack_min_prod))
         if bool(winnable.any()):
             cand = tgt_idx[winnable]; cand_prod = tgt_prod[winnable]
             best = int(cand[int(cand_prod.argmax().item())].item())
@@ -572,6 +573,23 @@ def plan_lite_waves(
         score = _apply_chenghuo_boost(score=score, obs=obs, garrison_status=garrison_status,
             target_idx=target_idx, cand_tgt_short=cand_tgt_short, prod=prod,
             player_count=player_count, config=config)
+
+    # 向高分看齐(>1200 彗星仅18%打敌76%回援): 彗星源星不打瘦敌(prod<门槛) → 该候选 -inf,
+    # 兵落入 leftover 由 regroup 回援/巩固自己 (彗星当兵力调度跳板, 不强袭守得住的瘦敌)
+    _camp = float(getattr(config, "comet_attack_min_prod", 0.0))
+    if _camp > 0:
+        _cids = obs_tensors.get("comet_planet_ids")
+        if _cids is not None and _cids.numel() > 0:
+            _cset = _cids.reshape(-1); _cset = _cset[_cset >= 0]
+            if _cset.numel() > 0:
+                _plids = obs_tensors["planets"][..., 0].long().reshape(-1)
+                _srcabs = cand_src.reshape(-1).clamp(0, P - 1)
+                _src_is_comet = (_plids[_srcabs].unsqueeze(1) == _cset.long().unsqueeze(0)).any(dim=1)
+                _tgtabs = target_idx[cand_tgt_short].clamp(0, P - 1)
+                _tgt_enemy = (obs.owner_abs[_tgtabs] >= 0) & (obs.owner_abs[_tgtabs] != float(pid))
+                _tgt_thin = prod[_tgtabs] < _camp
+                _suppress = _src_is_comet & _tgt_enemy & _tgt_thin
+                score = torch.where(_suppress, torch.full_like(score, float("-inf")), score)
 
     wave_entries, leftover = _greedy_select(
         P=P, W=W, device=device, dtype=dtype, score=score,
