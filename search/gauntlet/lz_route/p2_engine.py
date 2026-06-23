@@ -158,7 +158,9 @@ class ProducerLiteConfig:
     comet_prod_bonus: float = 4.0
     # 2P 彗星离场前纯保兵(金蝉脱壳): 占领的彗星即将消失时撤全兵回最近可达友星, 不打敌
     # (高分实证彗星打敌收益差, 2P 只需保住彗星上的兵不白丢, 不需价值评估/跳板/打敌)
-    enable_comet_save: bool = False   # V7 去保守: 2P彗星保兵关 (回V5, V6保守化Kaggle暴跌)
+    # 2P 彗星离场保兵(非刻意): 不主动占彗星, 但若顺路有兵在即将消失的彗星上 → 必须全部撤离
+    # 到临近的中立(就近占领扩张)或己星(增援), 别白丢。这是资源保全(撤中立还扩张), 非进攻保守化。
+    enable_comet_save: bool = True
     comet_save_remaining: int = 7
     enable_opportunist: bool = False
     opportunist_max_garrison: float = 15.0
@@ -1138,27 +1140,32 @@ def _comet_save_garrison(movement, obs, obs_tensors, cache, config):
         if int(pl_ids[i].item()) in urgent:
             urgent_mask[i] = True
     src_mask = obs.owned & obs.alive & urgent_mask & (obs.ships >= float(config.min_ships_to_launch))
-    friend = obs.owned & obs.alive
-    fr_idx = friend.nonzero(as_tuple=False).squeeze(1)
-    if not bool(src_mask.any()) or int(fr_idx.numel()) == 0:
+    # 撤离目标 = 己星(增援, 无条件) ∪ 中立星(就近占领扩张); 排除即将离场的彗星自己, 不撤敌星
+    dst_mask = obs.alive & (obs.owned | (obs.owner_abs == -1)) & (~urgent_mask)
+    dst_idx = dst_mask.nonzero(as_tuple=False).squeeze(1)
+    if not bool(src_mask.any()) or int(dst_idx.numel()) == 0:
         return _empty_entries(device, dtype)
     d0 = cache.cross_dist[0].to(dtype)
     src_list = src_mask.nonzero(as_tuple=False).squeeze(1)
-    Ns = int(src_list.numel()); Nf = int(fr_idx.numel())
+    Ns = int(src_list.numel()); Nd = int(dst_idx.numel())
     src_ships = obs.ships.to(dtype)[src_list]
-    aimF = intercept_angle(movement, src_list.view(Ns, 1), fr_idx.view(1, Nf),
-                           src_ships.view(Ns, 1).expand(Ns, Nf))
-    viableF = aimF["viable"].reshape(Ns, Nf)
+    aimD = intercept_angle(movement, src_list.view(Ns, 1), dst_idx.view(1, Nd),
+                           src_ships.view(Ns, 1).expand(Ns, Nd))
+    viableD = aimD["viable"].reshape(Ns, Nd)
+    dst_is_neutral = (obs.owner_abs[dst_idx] == -1)            # [Nd]
+    dst_ships = obs.ships.to(dtype)[dst_idx]                   # [Nd] 守军(己星增援不看, 中立要打下)
     ev_s = []; ev_d = []; ev_n = []
     for row, s in enumerate(src_list.tolist()):
         n = float(int(obs.ships[s].item()))
         if n < float(config.min_ships_to_launch):
             continue
-        frow = viableF[row] & (fr_idx != s)                    # 可达(不撞太阳)的友星
-        if not bool(frow.any()):
+        # 己星无条件可去(增援); 中立需全兵能打下(n > 守军*1.1); 都要可达(不撞太阳)且非自己
+        winnable = (~dst_is_neutral) | (dst_ships * 1.1 < n)
+        ok = viableD[row] & (dst_idx != s) & winnable
+        if not bool(ok.any()):
             continue
-        cand_fi = fr_idx[frow]
-        best = int(cand_fi[int(d0[s, cand_fi].argmin().item())].item())  # 最近友星
+        cand = dst_idx[ok]
+        best = int(cand[int(d0[s, cand].argmin().item())].item())  # 临近的中立或己星, 就近
         ev_s.append(s); ev_d.append(best); ev_n.append(n)
     if not ev_s:
         return _empty_entries(device, dtype)
