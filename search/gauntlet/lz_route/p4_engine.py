@@ -820,7 +820,13 @@ CONFIG_4P = dataclasses.replace(
     max_regroup_time=6.0,
     regroup_pressure_delta_min=0.25,
     max_regroup_targets_per_source=8,
-    reinforce_size_beta=1.5,  # V7 适度激进打敌 (beta2.2→1.5, 本地4P夺冠30→38; 去保守回V5+激进). evac/克制已去(V6保守化Kaggle暴跌961)
+    # V8: 4P 回纯 producer (= Kaggle 实测最强 hoard_g2 1117). 关彗星/三计/僵局/hoard —
+    # 数据证彗星拖累4P(本地夺冠 彗星30% vs 纯producer38%; V5彗星系1104<纯producer1117).
+    enable_comet=False,
+    enable_opportunist=False,
+    enable_chenghuo=False,
+    enable_stalemate_break=False,
+    hoard_min_planets=0,
 )
 
 
