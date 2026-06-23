@@ -158,7 +158,7 @@ class ProducerLiteConfig:
     comet_prod_bonus: float = 4.0
     # 2P 彗星离场前纯保兵(金蝉脱壳): 占领的彗星即将消失时撤全兵回最近可达友星, 不打敌
     # (高分实证彗星打敌收益差, 2P 只需保住彗星上的兵不白丢, 不需价值评估/跳板/打敌)
-    enable_comet_save: bool = True
+    enable_comet_save: bool = False   # V7 去保守: 2P彗星保兵关 (回V5, V6保守化Kaggle暴跌)
     comet_save_remaining: int = 7
     enable_opportunist: bool = False
     opportunist_max_garrison: float = 15.0

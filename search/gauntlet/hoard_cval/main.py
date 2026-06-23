@@ -91,7 +91,7 @@ class ProducerLiteConfig:
     comet_reach: float = 30.0        # 彗星轨迹点到目标的可达距离(够近才算够得到打)
     comet_value_window: int = 18     # 看未来多少步轨迹
     comet_value_threshold: float = 2.0  # 轨迹可达目标的加权价值(prod/守军) >= 此值才占
-    comet_attack_min_prod: float = 4.0  # 彗星清仓打敌的最低 prod 门槛: 向高分看齐(>1200 仅18%打敌76%回援) —— 瘦敌星(prod<4)不打改回援保兵, 只打肥敌
+    comet_attack_min_prod: float = 0.0  # V7 去保守: 0=不限制彗星打敌(V6克制版Kaggle暴跌961, 进攻保守是毒药)
     enable_opportunist: bool = True   # 欲擒: 打弱守强敌(彗星投送敌后配此最佳) — 连招默认开
     opportunist_boost: float = 1.5
     opportunist_max_garrison: float = 15.0
@@ -820,7 +820,7 @@ CONFIG_4P = dataclasses.replace(
     max_regroup_time=6.0,
     regroup_pressure_delta_min=0.25,
     max_regroup_targets_per_source=8,
-    enable_evacuation=True,   # 4P 出逃保兵 (支线A +6 唯一正收益): 被集火打崩→撤全兵反打敌后
+    reinforce_size_beta=1.5,  # V7 适度激进打敌 (beta2.2→1.5, 本地4P夺冠30→38; 去保守回V5+激进). evac/克制已去(V6保守化Kaggle暴跌961)
 )
 
 
